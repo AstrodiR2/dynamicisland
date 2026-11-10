@@ -1,0 +1,123 @@
+// English Android resources are the source of truth for settings and SystemUI text.
+import groovy.json.JsonOutput
+import groovy.xml.XmlParser
+
+// Android escapes are also decoded for the JVM resource catalog (SystemUI uses the module classloader).
+def androidText = { String source ->
+    String text = source
+    if (text.startsWith('"') && text.endsWith('"')) text = text.substring(1, text.length() - 1)
+    StringBuilder result = new StringBuilder()
+    for (int i = 0; i < text.length(); i++) {
+        char c = text.charAt(i)
+        if (c == '\\' && i + 1 < text.length()) {
+            char next = text.charAt(++i)
+            if (next == 'n') result.append('\n')
+            else if (next == 't') result.append('\t')
+            else if (next == 'r') result.append('\r')
+            else if (next == 'u' && i + 4 < text.length()) {
+                result.append((char) Integer.parseInt(text.substring(i + 1, i + 5), 16)); i += 4
+            } else result.append(next)
+        } else result.append(c)
+    }
+    result.toString()
+}
+def propertiesValue = { String value ->
+    value.replace('\\', '\\\\').replace('\n', '\\n').replace('\r', '\\r').replace('\t', '\\t').replace(' ', '\\ ')
+}
+def catalogDir = layout.buildDirectory.dir('generated/localization/resources')
+def generateCatalog = tasks.register('generateLocalizationCatalog') {
+    inputs.files(fileTree('src/main/res') { include 'values*/strings.xml'; include 'xml/locales_config.xml' })
+    outputs.dir(catalogDir)
+    doLast {
+        File output = catalogDir.get().asFile
+        project.delete(output)
+        def parser = new XmlParser(false, false)
+        def config = parser.parse(file('src/main/res/xml/locales_config.xml'))
+        def languages = config.locale.collect { it.attribute('android:name').toString() }
+        def labels = [:]
+        languages.each { language ->
+            String qualifier = language.replaceAll(/-([A-Z]{2})$/, '-r$1') // pt-BR -> pt-rBR
+            File input = file('src/main/res/' + (language == 'en' ? 'values' : 'values-' + qualifier) + '/strings.xml')
+            def strings = [:]
+            if (input.exists()) parser.parse(input).string.each { node ->
+                String key = node.attribute('name')
+                if (key.startsWith('island_') || key.startsWith('stage_label_')) strings[key] = androidText(node.text())
+            }
+            File target = new File(output, 'dev/android/dynamicisland/i18n/' + language + '.properties')
+            target.parentFile.mkdirs()
+            target.setText(strings.sort().collect { key, value -> key + '=' + propertiesValue(value) }.join('\n') + '\n', 'UTF-8')
+            strings.each { key, value ->
+                if (key.startsWith('stage_label_')) {
+                    String identity = key.substring('stage_label_'.length())
+                    int split = identity.lastIndexOf('_')
+                    String kind = identity.substring(0, split)
+                    String stage = identity.substring(split + 1)
+                    if (!labels.containsKey(kind)) labels[kind] = [:]
+                    if (!labels[kind].containsKey(language)) labels[kind][language] = [:]
+                    labels[kind][language][stage] = value
+                }
+            }
+        }
+        File index = new File(output, 'dev/android/dynamicisland/i18n/languages.properties')
+        index.setText('supported=' + languages.join(',') + '\n', 'UTF-8')
+        File rules = new File(output, 'dev/android/dynamicisland/rules/builtin-translations.json')
+        rules.parentFile.mkdirs()
+        rules.setText(JsonOutput.prettyPrint(JsonOutput.toJson([status_labels: labels])) + '\n', 'UTF-8')
+    }
+}
+android.sourceSets.main.resources.srcDir(catalogDir)
+tasks.named('preBuild').configure { dependsOn(generateCatalog) }
+tasks.configureEach {
+    if (name.startsWith('process') && name.endsWith('JavaRes')) dependsOn(generateCatalog)
+}
+
+// In-memory LSPosed/Vector module loaders can expose classes without exposing APK Java resources.
+// Keep Android strings as the only translation source, but also compile the runtime catalogs/rules into dex.
+def embeddedDir = layout.buildDirectory.dir('generated/localization/java')
+def generateEmbedded = tasks.register('generateEmbeddedResources') {
+    dependsOn(generateCatalog)
+    inputs.dir(catalogDir)
+    inputs.files(fileTree('src/main/resources/dev/android/dynamicisland/rules') { include 'builtin-*.json' })
+    outputs.dir(embeddedDir)
+    doLast {
+        def resources = new TreeMap<String, String>()
+        fileTree(catalogDir).matching { include '**/*.properties'; include '**/*.json' }.files.each { input ->
+            String path = '/' + catalogDir.get().asFile.toPath().relativize(input.toPath()).toString().replace('\\', '/')
+            resources[path] = input.getText('UTF-8')
+        }
+        fileTree('src/main/resources/dev/android/dynamicisland/rules').matching { include 'builtin-*.json' }.files.each { input ->
+            resources['/dev/android/dynamicisland/rules/' + input.name] = input.getText('UTF-8')
+        }
+        StringBuilder source = new StringBuilder('package dev.android.dynamicisland.island;\n'
+                + '/** Generated runtime data for class-only module loaders; edit the original resources. */\n'
+                + 'public final class EmbeddedResources {\n'
+                + '    private EmbeddedResources() {}\n'
+                + '    public static String get(String path) {\n'
+                + '        if (path == null) return null;\n'
+                + '        switch (path) {\n')
+        int index = 0
+        resources.each { path, value ->
+            source.append('            case ').append(JsonOutput.toJson(path))
+                    .append(': return data').append(index++).append('();\n')
+        }
+        source.append('            default: return null;\n        }\n    }\n')
+        index = 0
+        resources.each { path, value ->
+            source.append('    private static String data').append(index++).append('() {\n')
+                    .append('        return new StringBuilder()\n')
+            // Bounded chunks avoid the JVM constant UTF-8 limit for larger dictionaries and translations.
+            for (int offset = 0; offset < value.length(); offset += 4000) {
+                source.append('                .append(')
+                        .append(JsonOutput.toJson(value.substring(offset, Math.min(offset + 4000, value.length()))))
+                        .append(')\n')
+            }
+            source.append('                .toString();\n    }\n')
+        }
+        source.append('}\n')
+        File target = new File(embeddedDir.get().asFile, 'dev/android/dynamicisland/island/EmbeddedResources.java')
+        target.parentFile.mkdirs()
+        target.setText(source.toString(), 'UTF-8')
+    }
+}
+android.sourceSets.main.java.srcDir(embeddedDir)
+tasks.named('preBuild').configure { dependsOn(generateEmbedded) }

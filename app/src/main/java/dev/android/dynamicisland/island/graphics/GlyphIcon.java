@@ -1,0 +1,636 @@
+package dev.android.dynamicisland.island.graphics;
+
+import android.content.res.ColorStateList;
+import android.graphics.Canvas;
+import android.graphics.ColorFilter;
+import android.graphics.Paint;
+import android.graphics.Path;
+import android.graphics.PixelFormat;
+import android.graphics.PorterDuff;
+import android.graphics.PorterDuffXfermode;
+import android.graphics.RectF;
+import android.graphics.drawable.Drawable;
+import android.os.SystemClock;
+import dev.android.dynamicisland.settings.ModuleSettings;
+
+/**
+ * Small pictograms for the transient event islands (battery, ringer, headphones). They are
+ * single-colour so the island can tint them like any other glyph. They play as Lottie animations
+ * ({@link LottieData}, embedded in code because a System UI process has no access to this module's
+ * resources); the canvas drawings below stay as the fallback if an animation cannot be parsed.
+ */
+public final class GlyphIcon extends Drawable {
+    /** Which pictogram to draw. {@code POWER_SAVE} is drawn as a battery with a plus cut out. */
+    public enum Kind { BATTERY, BATTERY_CHARGING, BELL, BELL_OFF, VIBRATE, HEADPHONES, CAMERA, MIC, LOCATION, MOON, PLANE, TORCH, HOTSPOT, ROTATE_LOCK, POWER_SAVE, DOWNLOAD, SPEAKER, FINGERPRINT, FACE, PIN, CALL_ANSWER, CALL_END, CAR, BLUETOOTH }
+
+    private static final int INTRINSIC_SIZE_PX = 96;
+    /** An icon drawn again after this long without a draw plays from the start, like a fresh island. */
+    private static final long REPLAY_GAP_MS = 1500L;
+
+    private static final java.util.Map<Kind, LottiePlayer> PLAYERS = new java.util.EnumMap<>(Kind.class);
+    private static final java.util.Set<Kind> UNPLAYABLE = java.util.EnumSet.noneOf(Kind.class);
+    /** Per kind: when the current play started and when it was last drawn (uptime millis). */
+    private static final java.util.Map<Kind, long[]> PLAYBACK = new java.util.EnumMap<>(Kind.class);
+    private static boolean frozen;
+
+    private final Kind kind;
+    /** Battery fill, 0..1; 1 for every other pictogram. */
+    private final float level;
+    private final Paint paint = new Paint(Paint.ANTI_ALIAS_FLAG);
+    private final Path path = new Path();
+    private final RectF rect = new RectF();
+    private int color = 0xFFFFFFFF;
+    /** Drawable alpha (0..255), multiplied with the alpha of {@link #color}. */
+    private int alpha = 255;
+
+    private GlyphIcon(Kind kind, float level) {
+        this.kind = kind;
+        this.level = Math.max(0f, Math.min(1f, level));
+    }
+
+    public static GlyphIcon battery(float level, boolean charging) {
+        return new GlyphIcon(charging ? Kind.BATTERY_CHARGING : Kind.BATTERY, level);
+    }
+
+    /** The power-saving battery, filled to the real charge. */
+    public static GlyphIcon powerSave(float level) {
+        return new GlyphIcon(Kind.POWER_SAVE, level);
+    }
+
+    public static GlyphIcon of(Kind kind) {
+        return new GlyphIcon(kind, 1f);
+    }
+
+    /** Tests draw the finished animation instead of whatever frame the clock happens to be at. */
+    public static void setPlaybackFrozen(boolean freeze) {
+        frozen = freeze;
+    }
+
+    /** True while the animation still moves, so the island keeps its frame loop running. */
+    public boolean animating() {
+        if (ModuleSettings.stillIcons()) return false;
+        LottiePlayer p = player(kind);
+        if (p == null || frozen) {
+            return false;
+        }
+        long[] state = PLAYBACK.get(kind);
+        return state == null || SystemClock.uptimeMillis() - state[0] < p.durationMillis();
+    }
+
+    private static String animationName(Kind kind) {
+        switch (kind) {
+            case BATTERY_CHARGING:
+                return "battery_charging";
+            case BELL_OFF:
+                return "bell_off";
+            case POWER_SAVE:
+                return "power_save";
+            case ROTATE_LOCK:
+                return "rotate_lock";
+            default:
+                return kind.name().toLowerCase(java.util.Locale.ROOT);
+        }
+    }
+
+    private static LottiePlayer player(Kind kind) {
+        LottiePlayer p = PLAYERS.get(kind);
+        if (p == null && !UNPLAYABLE.contains(kind)) {
+            String json = LottieData.get(animationName(kind));
+            p = json == null ? null : LottiePlayer.parse(json);
+            if (p == null) {
+                UNPLAYABLE.add(kind);
+            } else {
+                PLAYERS.put(kind, p);
+            }
+        }
+        return p;
+    }
+
+    private float elapsedMillis(LottiePlayer p) {
+        if (frozen || ModuleSettings.stillIcons()) {
+            return p.durationMillis();
+        }
+        long now = SystemClock.uptimeMillis();
+        long[] state = PLAYBACK.get(kind);
+        if (state == null) {
+            state = new long[] {now, now};
+            PLAYBACK.put(kind, state);
+        } else if (now - state[1] > REPLAY_GAP_MS) {
+            state[0] = now;
+        }
+        state[1] = now;
+        return now - state[0];
+    }
+
+    @Override
+    public void setTintList(ColorStateList tint) {
+        if (tint != null) {
+            color = tint.getDefaultColor();
+            invalidateSelf();
+        }
+    }
+
+    @Override
+    public void setTint(int tintColor) {
+        color = tintColor;
+        invalidateSelf();
+    }
+
+    @Override
+    public void setAlpha(int newAlpha) {
+        alpha = newAlpha;
+    }
+
+    @Override
+    public void setColorFilter(ColorFilter filter) {
+        paint.setColorFilter(filter);
+    }
+
+    @Override
+    public int getOpacity() {
+        return PixelFormat.TRANSLUCENT;
+    }
+
+    @Override
+    public int getIntrinsicWidth() {
+        return INTRINSIC_SIZE_PX;
+    }
+
+    @Override
+    public int getIntrinsicHeight() {
+        return INTRINSIC_SIZE_PX;
+    }
+
+    /** Bounds of the drawing in progress; an icon is drawn on one thread, so one rectangle serves every frame. */
+    private final RectF drawBounds = new RectF();
+
+    @Override
+    public void draw(Canvas c) {
+        RectF bounds = drawBounds;
+        bounds.set(getBounds());
+        if (bounds.isEmpty()) {
+            return;
+        }
+        float s = Math.min(bounds.width(), bounds.height());
+        float cx = bounds.centerX();
+        float cy = bounds.centerY();
+        int effectiveAlpha = Math.round((color >>> 24) * (alpha / 255f));
+        LottiePlayer player = player(kind);
+        if (player != null) {
+            player.setLevel(kind == Kind.BATTERY || kind == Kind.BATTERY_CHARGING || kind == Kind.POWER_SAVE ? level : -1.0f);
+            float side = Math.min(bounds.width(), bounds.height());
+            bounds.set(cx - (side / 2), cy - (side / 2), cx + (side / 2), cy + (side / 2));
+            player.draw(c, bounds, elapsedMillis(player), (color & 0x00FFFFFF) | (effectiveAlpha << 24));
+            return;
+        }
+        paint.setXfermode(null);
+        paint.setColor((color & 0x00FFFFFF) | (effectiveAlpha << 24));
+        switch (kind) {
+            case BATTERY:
+            case BATTERY_CHARGING:
+            case POWER_SAVE:
+                drawBattery(c, cx, cy, s);
+                break;
+            case BELL:
+                drawBell(c, cx, cy, s, false);
+                break;
+            case BELL_OFF:
+                drawBell(c, cx, cy, s, true);
+                break;
+            case VIBRATE:
+                drawVibrate(c, cx, cy, s);
+                break;
+            case HEADPHONES:
+                drawHeadphones(c, cx, cy, s);
+                break;
+            case CAR:
+                drawCar(c, cx, cy, s);
+                break;
+            case BLUETOOTH:
+                drawBluetooth(c, cx, cy, s);
+                break;
+            case CAMERA:
+                drawCamera(c, cx, cy, s);
+                break;
+            case MIC:
+                drawMic(c, cx, cy, s);
+                break;
+            case LOCATION:
+                drawLocation(c, cx, cy, s);
+                break;
+            case MOON:
+                drawMoon(c, cx, cy, s);
+                break;
+            case PLANE:
+                drawPlane(c, cx, cy, s);
+                break;
+            case TORCH:
+                drawTorch(c, cx, cy, s);
+                break;
+            case HOTSPOT:
+                drawHotspot(c, cx, cy, s);
+                break;
+            case ROTATE_LOCK:
+                drawRotateLock(c, cx, cy, s);
+                break;
+            case DOWNLOAD:
+                drawDownload(c, cx, cy, s);
+                break;
+            case SPEAKER:
+                drawSpeaker(c, cx, cy, s);
+                break;
+            case FINGERPRINT:
+                drawFingerprint(c, cx, cy, s);
+                break;
+            case FACE:
+                drawFace(c, cx, cy, s);
+                break;
+            case PIN:
+                drawPin(c, cx, cy, s);
+                break;
+            case CALL_ANSWER:
+            case CALL_END:
+                Glyphs.draw(c, kind == Kind.CALL_ANSWER ? Glyphs.ANSWER : Glyphs.HANGUP, cx, cy, s, paint);
+                break;
+            default:
+                break;
+        }
+    }
+
+    private void drawCar(Canvas c, float cx, float cy, float s) {
+        paint.setStyle(Paint.Style.STROKE);
+        paint.setStrokeWidth(s * .065f);
+        paint.setStrokeCap(Paint.Cap.ROUND);
+        paint.setStrokeJoin(Paint.Join.ROUND);
+        rect.set(cx-s*.38f, cy-s*.03f, cx+s*.38f, cy+s*.25f);
+        c.drawRoundRect(rect, s*.07f, s*.07f, paint);
+        path.reset();
+        path.moveTo(cx-s*.32f,cy-s*.03f); path.lineTo(cx-s*.23f,cy-s*.28f);
+        path.lineTo(cx+s*.23f,cy-s*.28f); path.lineTo(cx+s*.32f,cy-s*.03f);
+        c.drawPath(path,paint);
+        c.drawLine(cx-s*.27f,cy+s*.25f,cx-s*.27f,cy+s*.34f,paint);
+        c.drawLine(cx+s*.27f,cy+s*.25f,cx+s*.27f,cy+s*.34f,paint);
+        c.drawLine(cx-s*.26f,cy+s*.1f,cx-s*.16f,cy+s*.1f,paint);
+        c.drawLine(cx+s*.16f,cy+s*.1f,cx+s*.26f,cy+s*.1f,paint);
+        paint.setStyle(Paint.Style.FILL);
+    }
+
+    private void drawBluetooth(Canvas c, float cx, float cy, float s) {
+        paint.setStyle(Paint.Style.STROKE);
+        paint.setStrokeWidth(s*.065f);
+        paint.setStrokeCap(Paint.Cap.ROUND);
+        paint.setStrokeJoin(Paint.Join.ROUND);
+        path.reset();
+        path.moveTo(cx-s*.22f,cy-s*.24f); path.lineTo(cx+s*.21f,cy+s*.22f);
+        path.lineTo(cx,cy+s*.42f); path.lineTo(cx,cy-s*.42f);
+        path.lineTo(cx+s*.21f,cy-s*.22f); path.lineTo(cx-s*.22f,cy+s*.24f);
+        c.drawPath(path,paint);
+        paint.setStyle(Paint.Style.FILL);
+    }
+
+    private void drawBattery(Canvas c, float cx, float cy, float s) {
+        float w = s * 0.78f;
+        float h = s * 0.42f;
+        float stroke = Math.max(1.5f, s * 0.06f);
+        int layer = c.saveLayer(cx - s, cy - s, cx + s, cy + s, null);
+        paint.setStyle(Paint.Style.STROKE);
+        paint.setStrokeWidth(stroke);
+        rect.set(cx - (w / 2) + (stroke / 2), cy - (h / 2) + (stroke / 2), cx + (w / 2) - (stroke / 2) - (s * 0.06f), cy + (h / 2) - (stroke / 2));
+        float r = h * 0.28f;
+        c.drawRoundRect(rect, r, r, paint);
+        paint.setStyle(Paint.Style.FILL);
+        // positive terminal
+        rect.set(cx + (w / 2) - (s * 0.06f) + (stroke * 0.4f), cy - (h * 0.17f), cx + (w / 2) + (stroke * 0.2f), cy + (h * 0.17f));
+        c.drawRoundRect(rect, stroke / 2, stroke / 2, paint);
+        // level
+        float pad = stroke * 1.7f;
+        float left = cx - (w / 2) + pad;
+        float right = cx + (w / 2) - (s * 0.06f) - pad;
+        rect.set(left, cy - (h / 2) + pad, left + Math.max(stroke, (right - left) * level), cy + (h / 2) - pad);
+        c.drawRoundRect(rect, r * 0.5f, r * 0.5f, paint);
+        if (kind == Kind.POWER_SAVE) {
+            paint.setXfermode(new PorterDuffXfermode(PorterDuff.Mode.CLEAR));
+            float arm = h * 0.3f;
+            float t = Math.max(stroke * 0.7f, 1.5f);
+            float px = cx - (w * 0.04f);
+            rect.set(px - arm, cy - (t / 2), px + arm, cy + (t / 2));
+            c.drawRect(rect, paint);
+            rect.set(px - (t / 2), cy - arm, px + (t / 2), cy + arm);
+            c.drawRect(rect, paint);
+            paint.setXfermode(null);
+        }
+        if (kind == Kind.BATTERY_CHARGING) {
+            paint.setXfermode(new PorterDuffXfermode(PorterDuff.Mode.CLEAR));
+            float bs = h * 0.9f;
+            path.reset();
+            float x0 = cx - (w * 0.04f) - (bs / 2);
+            float y0 = cy - (bs / 2);
+            path.moveTo(x0 + (0.58f * bs), y0 + (0.04f * bs));
+            path.lineTo(x0 + (0.2f * bs), y0 + (0.56f * bs));
+            path.lineTo(x0 + (0.47f * bs), y0 + (0.56f * bs));
+            path.lineTo(x0 + (0.4f * bs), y0 + (0.96f * bs));
+            path.lineTo(x0 + (0.8f * bs), y0 + (0.42f * bs));
+            path.lineTo(x0 + (0.53f * bs), y0 + (0.42f * bs));
+            path.close();
+            paint.setStrokeJoin(Paint.Join.ROUND);
+            paint.setStyle(Paint.Style.FILL_AND_STROKE);
+            paint.setStrokeWidth(stroke * 0.5f);
+            c.drawPath(path, paint);
+            paint.setXfermode(null);
+        }
+        c.restoreToCount(layer);
+        paint.setStyle(Paint.Style.FILL);
+    }
+
+    private void drawBell(Canvas c, float cx, float cy, float s, boolean off) {
+        float stroke = Math.max(1.5f, s * 0.07f);
+        int layer = c.saveLayer(cx - s, cy - s, cx + s, cy + s, null);
+        paint.setStyle(Paint.Style.FILL);
+        float top = cy - (s * 0.36f);
+        float bottom = cy + (s * 0.24f);
+        float half = s * 0.3f;
+        path.reset();
+        path.moveTo(cx - half, bottom);
+        path.cubicTo(cx - half, cy + (s * 0.02f), cx - (half * 0.8f), cy - (s * 0.05f), cx - (half * 0.8f), cy - (s * 0.12f));
+        path.cubicTo(cx - (half * 0.8f), top + (s * 0.02f), cx - (half * 0.4f), top, cx, top);
+        path.cubicTo(cx + (half * 0.4f), top, cx + (half * 0.8f), top + (s * 0.02f), cx + (half * 0.8f), cy - (s * 0.12f));
+        path.cubicTo(cx + (half * 0.8f), cy - (s * 0.05f), cx + half, cy + (s * 0.02f), cx + half, bottom);
+        path.close();
+        c.drawPath(path, paint);
+        rect.set(cx - (half * 1.15f), bottom - (stroke * 0.3f), cx + (half * 1.15f), bottom + (stroke * 0.9f));
+        c.drawRoundRect(rect, stroke, stroke, paint);
+        c.drawCircle(cx, bottom + (s * 0.1f), s * 0.07f, paint);
+        c.drawCircle(cx, top - (s * 0.02f), s * 0.05f, paint);
+        if (off) {
+            // slash with a transparent outline so it reads on top of the bell
+            paint.setStyle(Paint.Style.STROKE);
+            paint.setStrokeCap(Paint.Cap.ROUND);
+            paint.setXfermode(new PorterDuffXfermode(PorterDuff.Mode.CLEAR));
+            paint.setStrokeWidth(stroke * 2.6f);
+            c.drawLine(cx - (s * 0.34f), cy - (s * 0.34f), cx + (s * 0.34f), cy + (s * 0.34f), paint);
+            paint.setXfermode(null);
+            paint.setStrokeWidth(stroke);
+            c.drawLine(cx - (s * 0.34f), cy - (s * 0.34f), cx + (s * 0.34f), cy + (s * 0.34f), paint);
+        }
+        c.restoreToCount(layer);
+        paint.setStyle(Paint.Style.FILL);
+    }
+
+    private void drawVibrate(Canvas c, float cx, float cy, float s) {
+        float stroke = Math.max(1.5f, s * 0.07f);
+        paint.setStyle(Paint.Style.STROKE);
+        paint.setStrokeWidth(stroke);
+        paint.setStrokeCap(Paint.Cap.ROUND);
+        rect.set(cx - (s * 0.14f), cy - (s * 0.3f), cx + (s * 0.14f), cy + (s * 0.3f));
+        c.drawRoundRect(rect, s * 0.06f, s * 0.06f, paint);
+        for (int side = -1; side <= 1; side += 2) {
+            c.drawLine(cx + (side * s * 0.26f), cy - (s * 0.15f), cx + (side * s * 0.26f), cy + (s * 0.15f), paint);
+            c.drawLine(cx + (side * s * 0.38f), cy - (s * 0.09f), cx + (side * s * 0.38f), cy + (s * 0.09f), paint);
+        }
+        paint.setStyle(Paint.Style.FILL);
+    }
+
+    private void drawHeadphones(Canvas c, float cx, float cy, float s) {
+        float stroke = Math.max(1.5f, s * 0.08f);
+        paint.setStyle(Paint.Style.STROKE);
+        paint.setStrokeWidth(stroke);
+        paint.setStrokeCap(Paint.Cap.ROUND);
+        rect.set(cx - (s * 0.3f), cy - (s * 0.34f), cx + (s * 0.3f), cy + (s * 0.26f));
+        c.drawArc(rect, 180f, 180f, false, paint);
+        paint.setStyle(Paint.Style.FILL);
+        rect.set(cx - (s * 0.38f), cy - (s * 0.02f), cx - (s * 0.2f), cy + (s * 0.3f));
+        c.drawRoundRect(rect, s * 0.07f, s * 0.07f, paint);
+        rect.set(cx + (s * 0.2f), cy - (s * 0.02f), cx + (s * 0.38f), cy + (s * 0.3f));
+        c.drawRoundRect(rect, s * 0.07f, s * 0.07f, paint);
+    }
+
+    private void drawCamera(Canvas c, float cx, float cy, float s) {
+        int layer = c.saveLayer(cx - s, cy - s, cx + s, cy + s, null);
+        paint.setStyle(Paint.Style.FILL);
+        rect.set(cx - (s * 0.4f), cy - (s * 0.24f), cx + (s * 0.4f), cy + (s * 0.3f));
+        c.drawRoundRect(rect, s * 0.1f, s * 0.1f, paint);
+        rect.set(cx - (s * 0.18f), cy - (s * 0.36f), cx + (s * 0.1f), cy - (s * 0.2f));
+        c.drawRoundRect(rect, s * 0.05f, s * 0.05f, paint);
+        paint.setXfermode(new PorterDuffXfermode(PorterDuff.Mode.CLEAR));
+        c.drawCircle(cx, cy + (s * 0.03f), s * 0.17f, paint);
+        paint.setXfermode(null);
+        c.drawCircle(cx, cy + (s * 0.03f), s * 0.09f, paint);
+        c.restoreToCount(layer);
+    }
+
+    private void drawMic(Canvas c, float cx, float cy, float s) {
+        float stroke = Math.max(1.5f, s * 0.07f);
+        paint.setStyle(Paint.Style.FILL);
+        rect.set(cx - (s * 0.12f), cy - (s * 0.38f), cx + (s * 0.12f), cy + (s * 0.06f));
+        c.drawRoundRect(rect, s * 0.12f, s * 0.12f, paint);
+        paint.setStyle(Paint.Style.STROKE);
+        paint.setStrokeWidth(stroke);
+        paint.setStrokeCap(Paint.Cap.ROUND);
+        rect.set(cx - (s * 0.22f), cy - (s * 0.2f), cx + (s * 0.22f), cy + (s * 0.22f));
+        c.drawArc(rect, 0f, 180f, false, paint);
+        c.drawLine(cx, cy + (s * 0.22f), cx, cy + (s * 0.36f), paint);
+        c.drawLine(cx - (s * 0.12f), cy + (s * 0.36f), cx + (s * 0.12f), cy + (s * 0.36f), paint);
+        paint.setStyle(Paint.Style.FILL);
+    }
+
+    /** Three ridges and a core: arcs opening downwards, like the print on a sensor. */
+    private void drawFingerprint(Canvas c, float cx, float cy, float s) {
+        paint.setStyle(Paint.Style.STROKE);
+        paint.setStrokeWidth(Math.max(1.5f, s * 0.07f));
+        paint.setStrokeCap(Paint.Cap.ROUND);
+        for (float radius : new float[] {0.38f, 0.27f, 0.16f}) {
+            rect.set(cx - (s * radius), cy - (s * radius) - (s * 0.04f), cx + (s * radius), cy + (s * radius) - (s * 0.04f));
+            c.drawArc(rect, 200f, 140f, false, paint);
+        }
+        c.drawLine(cx, cy - (s * 0.06f), cx, cy + (s * 0.22f), paint);
+        c.drawLine(cx - (s * 0.2f), cy + (s * 0.02f), cx - (s * 0.2f), cy + (s * 0.3f), paint);
+        c.drawLine(cx + (s * 0.2f), cy + (s * 0.02f), cx + (s * 0.2f), cy + (s * 0.3f), paint);
+        paint.setStyle(Paint.Style.FILL);
+    }
+
+    /** Four corner brackets, two eyes and a smile. */
+    private void drawFace(Canvas c, float cx, float cy, float s) {
+        paint.setStyle(Paint.Style.STROKE);
+        paint.setStrokeWidth(Math.max(1.5f, s * 0.07f));
+        paint.setStrokeCap(Paint.Cap.ROUND);
+        float half = s * 0.36f;
+        float arm = s * 0.14f;
+        for (int sx = -1; sx <= 1; sx += 2) {
+            for (int sy = -1; sy <= 1; sy += 2) {
+                float x = cx + (sx * half);
+                float y = cy + (sy * half);
+                c.drawLine(x, y, x - (sx * arm), y, paint);
+                c.drawLine(x, y, x, y - (sy * arm), paint);
+            }
+        }
+        c.drawLine(cx - (s * 0.13f), cy - (s * 0.12f), cx - (s * 0.13f), cy - (s * 0.04f), paint);
+        c.drawLine(cx + (s * 0.13f), cy - (s * 0.12f), cx + (s * 0.13f), cy - (s * 0.04f), paint);
+        rect.set(cx - (s * 0.15f), cy - (s * 0.02f), cx + (s * 0.15f), cy + (s * 0.2f));
+        c.drawArc(rect, 20f, 140f, false, paint);
+        paint.setStyle(Paint.Style.FILL);
+    }
+
+    /** A keypad: three rows of three dots. */
+    private void drawPin(Canvas c, float cx, float cy, float s) {
+        paint.setStyle(Paint.Style.FILL);
+        float step = s * 0.22f;
+        for (int row = -1; row <= 1; row++) {
+            for (int col = -1; col <= 1; col++) {
+                c.drawCircle(cx + (col * step), cy + (row * step), s * 0.07f, paint);
+            }
+        }
+    }
+
+    private void drawLocation(Canvas c, float cx, float cy, float s) {
+        int layer = c.saveLayer(cx - s, cy - s, cx + s, cy + s, null);
+        paint.setStyle(Paint.Style.FILL);
+        path.reset();
+        path.addCircle(cx, cy - (s * 0.1f), s * 0.24f, Path.Direction.CW);
+        path.moveTo(cx - (s * 0.21f), cy + (s * 0.02f));
+        path.lineTo(cx, cy + (s * 0.4f));
+        path.lineTo(cx + (s * 0.21f), cy + (s * 0.02f));
+        path.close();
+        c.drawPath(path, paint);
+        paint.setXfermode(new PorterDuffXfermode(PorterDuff.Mode.CLEAR));
+        c.drawCircle(cx, cy - (s * 0.1f), s * 0.09f, paint);
+        paint.setXfermode(null);
+        c.restoreToCount(layer);
+    }
+
+    private void drawMoon(Canvas c, float cx, float cy, float s) {
+        int layer = c.saveLayer(cx - s, cy - s, cx + s, cy + s, null);
+        paint.setStyle(Paint.Style.FILL);
+        c.drawCircle(cx - (s * 0.02f), cy, s * 0.34f, paint);
+        paint.setXfermode(new PorterDuffXfermode(PorterDuff.Mode.CLEAR));
+        c.drawCircle(cx + (s * 0.16f), cy - (s * 0.12f), s * 0.3f, paint);
+        paint.setXfermode(null);
+        c.restoreToCount(layer);
+    }
+
+    private void drawPlane(Canvas c, float cx, float cy, float s) {
+        paint.setStyle(Paint.Style.FILL);
+        path.reset();
+        path.moveTo(cx + (s * 0.4f), cy);
+        path.lineTo(cx + (s * 0.06f), cy - (s * 0.07f));
+        path.lineTo(cx - (s * 0.12f), cy - (s * 0.36f));
+        path.lineTo(cx - (s * 0.2f), cy - (s * 0.36f));
+        path.lineTo(cx - (s * 0.12f), cy - (s * 0.04f));
+        path.lineTo(cx - (s * 0.3f), cy - (s * 0.02f));
+        path.lineTo(cx - (s * 0.38f), cy - (s * 0.12f));
+        path.lineTo(cx - (s * 0.42f), cy - (s * 0.12f));
+        path.lineTo(cx - (s * 0.38f), cy);
+        path.lineTo(cx - (s * 0.42f), cy + (s * 0.12f));
+        path.lineTo(cx - (s * 0.38f), cy + (s * 0.12f));
+        path.lineTo(cx - (s * 0.3f), cy + (s * 0.02f));
+        path.lineTo(cx - (s * 0.12f), cy + (s * 0.04f));
+        path.lineTo(cx - (s * 0.2f), cy + (s * 0.36f));
+        path.lineTo(cx - (s * 0.12f), cy + (s * 0.36f));
+        path.lineTo(cx + (s * 0.06f), cy + (s * 0.07f));
+        path.close();
+        c.drawPath(path, paint);
+    }
+
+    /** A flashlight pointing up with three rays of light, like the iOS symbol: flared head, neck, body with a switch. */
+    private void drawTorch(Canvas c, float cx, float cy, float s) {
+        float stroke = Math.max(1.4f, s * 0.075f);
+        paint.setStyle(Paint.Style.STROKE);
+        paint.setStrokeWidth(stroke);
+        paint.setStrokeCap(Paint.Cap.ROUND);
+        c.drawLine(cx, cy - (s * 0.46f), cx, cy - (s * 0.36f), paint);
+        c.drawLine(cx - (s * 0.27f), cy - (s * 0.39f), cx - (s * 0.21f), cy - (s * 0.30f), paint);
+        c.drawLine(cx + (s * 0.27f), cy - (s * 0.39f), cx + (s * 0.21f), cy - (s * 0.30f), paint);
+        int layer = c.saveLayer(cx - s, cy - s, cx + s, cy + s, null);
+        paint.setStyle(Paint.Style.FILL);
+        path.reset();
+        path.moveTo(cx - (s * 0.2f), cy - (s * 0.24f));
+        path.lineTo(cx + (s * 0.2f), cy - (s * 0.24f));
+        path.lineTo(cx + (s * 0.115f), cy - (s * 0.02f));
+        path.lineTo(cx - (s * 0.115f), cy - (s * 0.02f));
+        path.close();
+        c.drawPath(path, paint);
+        rect.set(cx - (s * 0.115f), cy + (s * 0.02f), cx + (s * 0.115f), cy + (s * 0.42f));
+        c.drawRoundRect(rect, s * 0.07f, s * 0.07f, paint);
+        paint.setXfermode(new PorterDuffXfermode(PorterDuff.Mode.CLEAR));
+        rect.set(cx - (s * 0.032f), cy + (s * 0.1f), cx + (s * 0.032f), cy + (s * 0.22f));
+        c.drawRoundRect(rect, s * 0.032f, s * 0.032f, paint);
+        paint.setXfermode(null);
+        c.restoreToCount(layer);
+    }
+
+    private void drawHotspot(Canvas c, float cx, float cy, float s) {
+        float stroke = Math.max(1.5f, s * 0.07f);
+        paint.setStyle(Paint.Style.STROKE);
+        paint.setStrokeWidth(stroke);
+        paint.setStrokeCap(Paint.Cap.ROUND);
+        for (int i = 1; i <= 2; i++) {
+            float r = s * 0.17f * i + (s * 0.02f);
+            rect.set(cx - r, cy - r, cx + r, cy + r);
+            c.drawArc(rect, -45f, 90f, false, paint);
+            c.drawArc(rect, 135f, 90f, false, paint);
+        }
+        paint.setStyle(Paint.Style.FILL);
+        c.drawCircle(cx, cy, s * 0.08f, paint);
+    }
+
+    private void drawRotateLock(Canvas c, float cx, float cy, float s) {
+        float stroke = Math.max(1.5f, s * 0.07f);
+        paint.setStyle(Paint.Style.STROKE);
+        paint.setStrokeWidth(stroke);
+        paint.setStrokeCap(Paint.Cap.ROUND);
+        rect.set(cx - (s * 0.34f), cy - (s * 0.34f), cx + (s * 0.34f), cy + (s * 0.34f));
+        c.drawArc(rect, -60f, 240f, false, paint);
+        path.reset();
+        float ax = cx + (s * 0.17f);
+        float ay = cy - (s * 0.29f);
+        path.moveTo(ax - (s * 0.1f), ay - (s * 0.04f));
+        path.lineTo(ax + (s * 0.04f), ay + (s * 0.02f));
+        path.lineTo(ax - (s * 0.04f), ay + (s * 0.14f));
+        paint.setStrokeJoin(Paint.Join.ROUND);
+        c.drawPath(path, paint);
+        paint.setStyle(Paint.Style.FILL);
+        rect.set(cx - (s * 0.12f), cy - (s * 0.02f), cx + (s * 0.12f), cy + (s * 0.16f));
+        c.drawRoundRect(rect, s * 0.03f, s * 0.03f, paint);
+        paint.setStyle(Paint.Style.STROKE);
+        rect.set(cx - (s * 0.07f), cy - (s * 0.14f), cx + (s * 0.07f), cy + (s * 0.06f));
+        c.drawArc(rect, 180f, 180f, false, paint);
+        paint.setStyle(Paint.Style.FILL);
+    }
+
+    private void drawDownload(Canvas c, float cx, float cy, float s) {
+        float stroke = Math.max(1.8f, s * 0.08f);
+        paint.setStyle(Paint.Style.STROKE);
+        paint.setStrokeWidth(stroke);
+        paint.setStrokeCap(Paint.Cap.ROUND);
+        paint.setStrokeJoin(Paint.Join.ROUND);
+        c.drawLine(cx, cy - (s * 0.32f), cx, cy + (s * 0.14f), paint);
+        path.reset();
+        path.moveTo(cx - (s * 0.18f), cy - (s * 0.04f));
+        path.lineTo(cx, cy + (s * 0.16f));
+        path.lineTo(cx + (s * 0.18f), cy - (s * 0.04f));
+        c.drawPath(path, paint);
+        c.drawLine(cx - (s * 0.3f), cy + (s * 0.32f), cx + (s * 0.3f), cy + (s * 0.32f), paint);
+        paint.setStyle(Paint.Style.FILL);
+    }
+
+    private void drawSpeaker(Canvas c, float cx, float cy, float s) {
+        float stroke = Math.max(1.5f, s * 0.07f);
+        paint.setStyle(Paint.Style.FILL);
+        path.reset();
+        path.moveTo(cx - (s * 0.36f), cy - (s * 0.12f));
+        path.lineTo(cx - (s * 0.18f), cy - (s * 0.12f));
+        path.lineTo(cx + (s * 0.02f), cy - (s * 0.3f));
+        path.lineTo(cx + (s * 0.02f), cy + (s * 0.3f));
+        path.lineTo(cx - (s * 0.18f), cy + (s * 0.12f));
+        path.lineTo(cx - (s * 0.36f), cy + (s * 0.12f));
+        path.close();
+        c.drawPath(path, paint);
+        paint.setStyle(Paint.Style.STROKE);
+        paint.setStrokeWidth(stroke);
+        paint.setStrokeCap(Paint.Cap.ROUND);
+        rect.set(cx - (s * 0.1f), cy - (s * 0.2f), cx + (s * 0.22f), cy + (s * 0.2f));
+        c.drawArc(rect, -50f, 100f, false, paint);
+        rect.set(cx - (s * 0.1f), cy - (s * 0.34f), cx + (s * 0.38f), cy + (s * 0.34f));
+        c.drawArc(rect, -50f, 100f, false, paint);
+        paint.setStyle(Paint.Style.FILL);
+    }
+}
